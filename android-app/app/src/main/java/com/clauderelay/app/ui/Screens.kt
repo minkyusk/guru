@@ -374,10 +374,6 @@ private fun ModeRow(ui: UiState, vm: AppViewModel) {
 }
 
 @Composable
-private fun Modifier.horizontalScroll(rememberScrollState()): Modifier =
-    this.then(Modifier.horizontalScroll(rememberScrollState()))
-
-@Composable
 private fun Bubble(isUser: Boolean, content: @Composable () -> Unit) {
     Box(Modifier.fillMaxWidth(), contentAlignment = if (isUser) Alignment.CenterEnd else Alignment.CenterStart) {
         Surface(
