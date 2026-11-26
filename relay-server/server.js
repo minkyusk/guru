@@ -10,6 +10,7 @@
  *     (or starts a new session with `--session-id <uuid>`)
  *
  * HTTP:  GET /api/health | /api/sessions | /api/sessions/:id/messages?limit=N | /api/projects
+ *        POST /api/upload?name=<file>  (raw body, returns { path } to pass as send.attachments)
  * WS:    /ws   (client -> server: subscribe, unsubscribe, send, interrupt)
  * Auth:  "Authorization: Bearer <token>" header, or ?token=<token>
  */
@@ -27,6 +28,10 @@ const { WebSocketServer } = require('ws');
 // ---------------------------------------------------------------- config
 const CONFIG_DIR = path.join(os.homedir(), '.claude-relay');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+// Files attached from the phone are stored here and passed to claude by absolute path.
+const UPLOAD_DIR = path.join(CONFIG_DIR, 'uploads');
+const UPLOAD_MAX_BYTES = 30 * 1024 * 1024;
+const UPLOAD_KEEP_DAYS = 14;
 
 function loadConfig() {
   let file = {};
@@ -362,8 +367,15 @@ const runs = new Map();
 
 function runningList() { return [...runs.keys()]; }
 
-async function startRun({ sessionId, cwd, text, permissionMode, model }) {
-  if (typeof text !== 'string' || !text.trim()) throw new Error('empty prompt');
+async function startRun({ sessionId, cwd, text, permissionMode, model, attachments }) {
+  if (typeof text !== 'string') text = '';
+  const files = await checkAttachments(attachments);
+  if (!text.trim() && !files.length) throw new Error('empty prompt');
+  if (files.length) {
+    text = (text.trim() || '첨부한 파일을 확인해 주세요.') +
+      '\n\n[휴대폰에서 첨부한 파일 — 맥미니에 저장됨, Read 도구로 열어 보세요]\n' +
+      files.map((f) => `- ${f}`).join('\n');
+  }
   const isNew = !sessionId;
   if (isNew) {
     sessionId = crypto.randomUUID();
@@ -386,6 +398,7 @@ async function startRun({ sessionId, cwd, text, permissionMode, model }) {
   const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--permission-mode', mode];
   args.push(...(isNew ? ['--session-id', sessionId] : ['--resume', sessionId]));
   if (typeof model === 'string' && /^[\w.\-\[\]]{1,64}$/.test(model)) args.push('--model', model);
+  if (files.length) args.push('--add-dir', UPLOAD_DIR);
   args.push(...cfg.extraArgs);
 
   log(`run ${isNew ? 'new' : 'resume'} ${sessionId} in ${cwd} (mode=${mode})`);
@@ -446,6 +459,79 @@ function interrupt(sessionId) {
   return true;
 }
 
+// ---------------------------------------------------------------- attachments
+function safeFileName(name) {
+  let n = String(name || '').split(/[\\/]/).pop().replace(/[\x00-\x1f<>:"|?*]/g, '_').trim();
+  n = n.replace(/^\.+/, '');
+  if (!n) n = 'file';
+  if (Buffer.byteLength(n) > 120) {
+    const ext = path.extname(n).slice(0, 16);
+    n = Buffer.from(n).subarray(0, 100).toString('utf8').replace(/\uFFFD/g, '') + ext;
+  }
+  return n;
+}
+
+async function saveUpload(req, name) {
+  const declared = Number(req.headers['content-length'] || 0);
+  if (declared > UPLOAD_MAX_BYTES) throw Object.assign(new Error(`파일이 너무 큽니다 (최대 ${UPLOAD_MAX_BYTES / 1048576}MB)`), { status: 413 });
+  const day = new Date().toISOString().slice(0, 10);
+  const dir = path.join(UPLOAD_DIR, day);
+  await fsp.mkdir(dir, { recursive: true, mode: 0o700 });
+  const file = path.join(dir, `${crypto.randomBytes(4).toString('hex')}-${safeFileName(name)}`);
+  const out = fs.createWriteStream(file, { mode: 0o600 });
+  let size = 0;
+  try {
+    await new Promise((resolve, reject) => {
+      req.on('data', (d) => {
+        size += d.length;
+        if (size > UPLOAD_MAX_BYTES) { req.destroy(); reject(Object.assign(new Error('파일이 너무 큽니다'), { status: 413 })); return; }
+        if (!out.write(d)) { req.pause(); out.once('drain', () => req.resume()); }
+      });
+      req.on('end', resolve);
+      req.on('error', reject);
+      out.on('error', reject);
+    });
+    await new Promise((r) => out.end(r));
+  } catch (e) {
+    out.destroy();
+    await fsp.unlink(file).catch(() => {});
+    throw e;
+  }
+  if (!size) { await fsp.unlink(file).catch(() => {}); throw Object.assign(new Error('빈 파일'), { status: 400 }); }
+  log(`upload ${file} (${size} bytes)`);
+  return { path: file, name: path.basename(file).slice(9), size };
+}
+
+async function checkAttachments(list) {
+  if (list == null) return [];
+  if (!Array.isArray(list) || list.length > 20) throw new Error('bad attachments');
+  const out = [];
+  for (const p of list) {
+    if (typeof p !== 'string' || !path.isAbsolute(p)) throw new Error('bad attachment path');
+    const abs = path.resolve(p);
+    if (!isInside(abs, UPLOAD_DIR) || abs === UPLOAD_DIR) throw new Error('attachment outside upload dir');
+    const st = await fsp.stat(abs).catch(() => null);
+    if (!st || !st.isFile()) throw new Error(`첨부 파일이 없습니다: ${path.basename(abs)}`);
+    out.push(abs);
+  }
+  return out;
+}
+
+async function pruneUploads() {
+  const cutoff = Date.now() - UPLOAD_KEEP_DAYS * 86400000;
+  let days = [];
+  try { days = await fsp.readdir(UPLOAD_DIR); } catch (_) { return; }
+  for (const d of days) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+    if (Date.parse(d + 'T00:00:00Z') < cutoff) {
+      await fsp.rm(path.join(UPLOAD_DIR, d), { recursive: true, force: true }).catch(() => {});
+      log('pruned uploads', d);
+    }
+  }
+}
+pruneUploads();
+setInterval(pruneUploads, 6 * 3600 * 1000).unref();
+
 // ---------------------------------------------------------------- HTTP
 function sendJson(res, code, obj) {
   const body = JSON.stringify(obj);
@@ -464,6 +550,9 @@ const server = http.createServer(async (req, res) => {
       const limit = Math.min(500, Number(url.searchParams.get('limit')) || 100);
       return sendJson(res, 200, { sessions: await listSessions(limit), running: runningList(), permissionModes: cfg.permissionModes });
     }
+    if (req.method === 'POST' && url.pathname === '/api/upload') {
+      return sendJson(res, 200, await saveUpload(req, url.searchParams.get('name')));
+    }
     if (req.method === 'GET' && url.pathname === '/api/projects') {
       const sessions = await listSessions(500);
       const seen = new Map();
@@ -478,8 +567,9 @@ const server = http.createServer(async (req, res) => {
     }
     return sendJson(res, 404, { error: 'not found' });
   } catch (e) {
-    log('http error', e);
-    return sendJson(res, 500, { error: e.message });
+    if (!e.status) log('http error', e);
+    if (res.headersSent) return res.end();
+    return sendJson(res, e.status || 500, { error: e.message });
   }
 });
 

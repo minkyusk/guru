@@ -11,6 +11,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody
+import okio.BufferedSink
+import okio.source
+import java.io.InputStream
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -93,6 +99,26 @@ class RelayClient(private val scope: CoroutineScope) {
             o.optBoolean("running", false),
         )
     }
+
+    /** Uploads one file to the Mac mini; returns its absolute path there (pass it to [send] as an attachment). */
+    suspend fun upload(name: String, size: Long, open: () -> InputStream): String = withContext(Dispatchers.IO) {
+        val body = object : RequestBody() {
+            override fun contentType(): MediaType = "application/octet-stream".toMediaType()
+            override fun contentLength(): Long = size
+            override fun writeTo(sink: BufferedSink) { open().use { sink.writeAll(it.source()) } }
+        }
+        val url = "$baseUrl/api/upload?name=" + java.net.URLEncoder.encode(name, "UTF-8").replace("+", "%20")
+        val req = Request.Builder().url(url).header("Authorization", "Bearer $token").post(body).build()
+        uploadHttp.newCall(req).execute().use { res ->
+            val text = res.body?.string().orEmpty()
+            if (res.code == 401) throw IOException("인증 실패: 토큰을 확인하세요")
+            val o = try { JSONObject(text) } catch (_: Exception) { JSONObject() }
+            if (!res.isSuccessful) throw IOException(o.optString("error").ifBlank { "HTTP ${res.code}" })
+            o.getString("path")
+        }
+    }
+
+    private val uploadHttp by lazy { http.newBuilder().writeTimeout(5, TimeUnit.MINUTES).readTimeout(2, TimeUnit.MINUTES).build() }
 
     // ------------------------------------------------------------ WebSocket
     fun connect() {
@@ -190,8 +216,9 @@ class RelayClient(private val scope: CoroutineScope) {
     }
 
     /** sessionId == null starts a new session in [cwd]. */
-    fun send(sessionId: String?, cwd: String?, text: String, permissionMode: String?, model: String?): Boolean {
+    fun send(sessionId: String?, cwd: String?, text: String, permissionMode: String?, model: String?, attachments: List<String> = emptyList()): Boolean {
         val o = JSONObject().put("type", "send").put("text", text)
+        if (attachments.isNotEmpty()) o.put("attachments", org.json.JSONArray(attachments))
         if (sessionId != null) o.put("sessionId", sessionId)
         if (cwd != null) o.put("cwd", cwd)
         if (!permissionMode.isNullOrBlank()) o.put("permissionMode", permissionMode)

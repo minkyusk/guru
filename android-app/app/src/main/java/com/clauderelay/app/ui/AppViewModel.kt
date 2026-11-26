@@ -1,6 +1,8 @@
 package com.clauderelay.app.ui
 
 import android.app.Application
+import android.net.Uri
+import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ProcessLifecycleOwner
@@ -34,6 +36,15 @@ data class ChatState(
     val lastRunInfo: String? = null,
 )
 
+/** A file picked on the phone. [path] is set once it is uploaded to the Mac mini. */
+data class Attachment(
+    val id: Long,
+    val name: String,
+    val size: Long,
+    val path: String? = null,
+    val error: String? = null,
+)
+
 data class UiState(
     val screen: Screen = Screen.Sessions,
     val conn: ConnState = ConnState.DISCONNECTED,
@@ -51,6 +62,7 @@ data class UiState(
     val host: String? = null,
     val snackbar: String? = null,
     val pendingNewSession: Boolean = false,
+    val attachments: List<Attachment> = emptyList(),
 )
 
 class AppViewModel(app: Application) : AndroidViewModel(app) {
@@ -183,23 +195,69 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ------------------------------------------------------------ attachments
+    private var nextAttachmentId = 1L
+
+    fun attach(uri: Uri) {
+        val cr = getApplication<Application>().contentResolver
+        var name = uri.lastPathSegment?.substringAfterLast('/') ?: "file"
+        var size = -1L
+        try {
+            cr.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    c.getString(0)?.let { name = it }
+                    if (!c.isNull(1)) size = c.getLong(1)
+                }
+            }
+        } catch (_: Exception) { }
+        if (size > MAX_UPLOAD) { toast("$name: 30MB 를 넘어 첨부할 수 없습니다"); return }
+        val a = Attachment(nextAttachmentId++, name, size)
+        _ui.update { it.copy(attachments = it.attachments + a) }
+        viewModelScope.launch {
+            try {
+                val path = client.upload(name, size) {
+                    cr.openInputStream(uri) ?: throw java.io.IOException("파일을 열 수 없습니다")
+                }
+                updateAttachment(a.id) { it.copy(path = path) }
+            } catch (e: Exception) {
+                updateAttachment(a.id) { it.copy(error = e.message ?: "업로드 실패") }
+                toast("$name 업로드 실패: ${e.message}")
+            }
+        }
+    }
+
+    fun removeAttachment(id: Long) = _ui.update { s -> s.copy(attachments = s.attachments.filterNot { it.id == id }) }
+
+    private fun updateAttachment(id: Long, f: (Attachment) -> Attachment) =
+        _ui.update { s -> s.copy(attachments = s.attachments.map { if (it.id == id) f(it) else it }) }
+
+    /** Paths of uploaded attachments, or null (with a toast) if some are still uploading/failed. */
+    private fun readyAttachments(): List<String>? {
+        val list = _ui.value.attachments
+        if (list.any { it.path == null && it.error == null }) { toast("파일을 올리는 중입니다. 잠시 뒤 보내세요."); return null }
+        if (list.any { it.error != null }) { toast("올리지 못한 파일을 지우고 보내세요"); return null }
+        return list.mapNotNull { it.path }
+    }
+
     // ------------------------------------------------------------ sending
     fun sendToCurrent(text: String): Boolean {
         val chat = _ui.value.chat ?: return false
-        if (text.isBlank()) return false
+        if (text.isBlank() && _ui.value.attachments.isEmpty()) return false
         if (chat.sessionId in _ui.value.running) {
             toast("아직 실행 중입니다. 끝난 뒤 보내거나 중지하세요.")
             return false
         }
-        val ok = client.send(chat.sessionId, null, text, _ui.value.permissionMode, _ui.value.model)
-        if (!ok) toast("서버에 연결되어 있지 않습니다")
+        val files = readyAttachments() ?: return false
+        val ok = client.send(chat.sessionId, null, text, _ui.value.permissionMode, _ui.value.model, files)
+        if (ok) _ui.update { it.copy(attachments = emptyList()) } else toast("서버에 연결되어 있지 않습니다")
         return ok
     }
 
     fun startNewSession(cwd: String, text: String): Boolean {
-        if (cwd.isBlank() || text.isBlank()) return false
-        val ok = client.send(null, cwd.trim(), text, _ui.value.permissionMode, _ui.value.model)
-        if (ok) _ui.update { it.copy(pendingNewSession = true) } else toast("서버에 연결되어 있지 않습니다")
+        if (cwd.isBlank() || (text.isBlank() && _ui.value.attachments.isEmpty())) return false
+        val files = readyAttachments() ?: return false
+        val ok = client.send(null, cwd.trim(), text, _ui.value.permissionMode, _ui.value.model, files)
+        if (ok) _ui.update { it.copy(pendingNewSession = true, attachments = emptyList()) } else toast("서버에 연결되어 있지 않습니다")
         return ok
     }
 
@@ -293,6 +351,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun openFromNotification(sessionId: String?) {
         if (sessionId != null && client.isConfigured) openSession(sessionId)
     }
+
+    companion object { const val MAX_UPLOAD = 30L * 1024 * 1024 }
 
     override fun onCleared() {
         client.disconnect()

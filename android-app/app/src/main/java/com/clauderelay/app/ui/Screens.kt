@@ -1,5 +1,7 @@
 package com.clauderelay.app.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -31,6 +33,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -44,6 +48,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.InputChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -215,7 +220,7 @@ fun SessionListScreen(ui: UiState, vm: AppViewModel) {
         }
     }
 
-    if (showNew) NewSessionDialog(ui, onDismiss = { showNew = false }) { cwd, text ->
+    if (showNew) NewSessionDialog(ui, vm, onDismiss = { showNew = false }) { cwd, text ->
         if (vm.startNewSession(cwd, text)) showNew = false
     }
 }
@@ -243,7 +248,8 @@ private fun SessionRow(s: SessionInfo, running: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun NewSessionDialog(ui: UiState, onDismiss: () -> Unit, onStart: (String, String) -> Unit) {
+private fun NewSessionDialog(ui: UiState, vm: AppViewModel, onDismiss: () -> Unit, onStart: (String, String) -> Unit) {
+    val picker = rememberFilePicker(vm)
     var cwd by rememberSaveable { mutableStateOf(ui.projects.firstOrNull()?.cwd ?: "") }
     var text by rememberSaveable { mutableStateOf("") }
     var menu by remember { mutableStateOf(false) }
@@ -266,11 +272,13 @@ private fun NewSessionDialog(ui: UiState, onDismiss: () -> Unit, onStart: (Strin
                     }
                 }
                 OutlinedTextField(text, { text = it }, label = { Text("첫 메시지") }, minLines = 3, modifier = Modifier.fillMaxWidth())
+                AttachmentRow(ui, vm)
+                TextButton(onClick = picker) { Icon(Icons.Default.AttachFile, null); Text("파일 첨부") }
                 Text("권한 모드: ${ui.permissionMode}", style = MaterialTheme.typography.labelSmall)
             }
         },
         confirmButton = {
-            TextButton(onClick = { onStart(cwd, text) }, enabled = !ui.pendingNewSession && cwd.isNotBlank() && text.isNotBlank()) {
+            TextButton(onClick = { onStart(cwd, text) }, enabled = !ui.pendingNewSession && cwd.isNotBlank() && (text.isNotBlank() || ui.attachments.isNotEmpty())) {
                 Text(if (ui.pendingNewSession) "시작 중…" else "시작")
             }
         },
@@ -336,10 +344,13 @@ fun ChatScreen(ui: UiState, vm: AppViewModel, sessionId: String) {
             }
             HorizontalDivider()
             ModeRow(ui, vm)
+            AttachmentRow(ui, vm)
+            val picker = rememberFilePicker(vm)
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp).navigationBarsPadding(),
                 verticalAlignment = Alignment.Bottom,
             ) {
+                IconButton(onClick = picker, enabled = !running) { Icon(Icons.Default.AttachFile, "파일 첨부") }
                 OutlinedTextField(
                     input, { input = it },
                     placeholder = { Text(if (running) "실행 중…" else "Claude에게 보낼 메시지") },
@@ -352,7 +363,7 @@ fun ChatScreen(ui: UiState, vm: AppViewModel, sessionId: String) {
                 } else {
                     FilledIconButton(
                         onClick = { if (vm.sendToCurrent(input)) input = "" },
-                        enabled = input.isNotBlank() && ui.conn == ConnState.CONNECTED,
+                        enabled = (input.isNotBlank() || ui.attachments.isNotEmpty()) && ui.conn == ConnState.CONNECTED,
                     ) { Icon(Icons.AutoMirrored.Filled.Send, "보내기") }
                 }
             }
@@ -362,13 +373,56 @@ fun ChatScreen(ui: UiState, vm: AppViewModel, sessionId: String) {
 
 @Composable
 private fun ModeRow(ui: UiState, vm: AppViewModel) {
-    val labels = mapOf("acceptEdits" to "편집 자동승인", "default" to "기본", "plan" to "계획", "bypassPermissions" to "모든 권한")
+    val labels = mapOf("auto" to "자동 판단", "acceptEdits" to "편집 자동승인", "default" to "기본", "plan" to "계획", "bypassPermissions" to "모든 권한")
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 8.dp).horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         ui.permissionModes.forEach { m ->
             FilterChip(selected = ui.permissionMode == m, onClick = { vm.setPermissionMode(m) }, label = { Text(labels[m] ?: m, fontSize = 12.sp) })
+        }
+    }
+}
+
+/** Returns a click handler that opens the system file picker (several files at once). */
+@Composable
+private fun rememberFilePicker(vm: AppViewModel): () -> Unit {
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+        uris.forEach(vm::attach)
+    }
+    return { launcher.launch("*/*") }
+}
+
+private fun sizeText(n: Long): String = when {
+    n < 0 -> ""
+    n < 1024 -> "${n}B"
+    n < 1024 * 1024 -> "${n / 1024}KB"
+    else -> String.format("%.1fMB", n / 1048576.0)
+}
+
+@Composable
+private fun AttachmentRow(ui: UiState, vm: AppViewModel) {
+    if (ui.attachments.isEmpty()) return
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 8.dp).horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        ui.attachments.forEach { a ->
+            InputChip(
+                selected = false,
+                onClick = { vm.removeAttachment(a.id) },
+                label = {
+                    Text(
+                        (if (a.error != null) "⚠ " else "") + a.name + " " + sizeText(a.size),
+                        fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.widthIn(max = 200.dp),
+                    )
+                },
+                leadingIcon = if (a.path == null && a.error == null) {
+                    { CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 2.dp) }
+                } else null,
+                trailingIcon = { Icon(Icons.Default.Close, "빼기", Modifier.size(16.dp)) },
+            )
         }
     }
 }
