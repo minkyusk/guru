@@ -1,0 +1,16 @@
+{
+  "name": "claude-code-relay-server",
+  "version": "1.0.0",
+  "description": "Relays Claude Code session input/output from a Mac mini to the Android app",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
