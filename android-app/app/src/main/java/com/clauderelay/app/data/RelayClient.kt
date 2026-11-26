@@ -120,7 +120,9 @@ class RelayClient(private val scope: CoroutineScope) {
         val u = baseUrl.toHttpUrl()
         val scheme = if (u.isHttps) "wss" else "ws"
         val port = if (u.port == (if (u.isHttps) 443 else 80)) "" else ":${u.port}"
-        return "$scheme://${u.host}$port/ws?token=${java.net.URLEncoder.encode(token, "UTF-8")}"
+        // Keep the base path so the relay can sit behind a reverse proxy prefix (e.g. https://host/claude-relay).
+        val prefix = u.encodedPath.trimEnd('/')
+        return "$scheme://${u.host}$port$prefix/ws?token=${java.net.URLEncoder.encode(token, "UTF-8")}"
     }
 
     private fun openSocket() {
